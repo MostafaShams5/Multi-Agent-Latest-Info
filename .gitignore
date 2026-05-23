@@ -1,0 +1,17 @@
+# Environments
+venv/
+env/
+common_env/
+.env
+
+# Python Cache
+__pycache__/
+*.pyc
+
+# Google API Secrets
+credentials.json
+token.json
+
+# Database local storage
+dump.rdb
+qdrant_data/
