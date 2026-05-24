@@ -1,14 +1,16 @@
+import torch
 from pydantic_ai import Agent
 from tools.search import perform_web_search
 from llmlingua import PromptCompressor
 from infrastructure.logger import logger
-import os
 
+# 1. Dynamic Device Mapping: Uses GPU on AWS G5, falls back to CPU locally
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 compressor = PromptCompressor(
     model_name="microsoft/llmlingua-2-bert-base-multilingual-cased-meetingbank", 
     use_llmlingua2=True,
-    device_map="cpu"  # <--- ADD THIS LINE TO FORCE CPU MODE
+    device_map=DEVICE
 )
 
 research_agent = Agent(
@@ -16,28 +18,31 @@ research_agent = Agent(
     system_prompt="You are an expert analyst. Write clean, professional email reports. Use markdown headings."
 )
 
+# Set a threshold: Only compress if the text is massive
+COMPRESSION_THRESHOLD_CHARS = 3000
+
 async def researcher_agent(topic: str) -> str:
     logger.info(f"🕵️‍♂️ [Worker Agent] Investigating: '{topic}'")
     
-    # 1. Gather Raw Data
-    search_query = f"Latest news and facts about {topic}"
-    raw_data = await perform_web_search(query=search_query)
+    raw_data = await perform_web_search(query=f"Latest news and facts about {topic}")
     
-    # 2. Token Compression (LLMLingua)
-    # Reduces massive context windows while retaining semantic meaning
-    logger.info("🗜️ Compressing web data tokens...")
-    compressed_data = compressor.compress_prompt(
-        context=[raw_data],
-        instruction="Extract key facts.",
-        rate=0.5, # Compress by 50%
-        force_tokens=['\n', '.']
-    )
+    # 2. Smart Bypass: Skip LLMLingua if the payload is small
+    if len(raw_data) < COMPRESSION_THRESHOLD_CHARS:
+        logger.info("⚡ Data payload is small. Bypassing LLMLingua compression.")
+        processed_data = raw_data
+    else:
+        logger.info(f"🗜️ Compressing {len(raw_data)} chars on {DEVICE.upper()}...")
+        compressed = compressor.compress_prompt(
+            context=[raw_data],
+            instruction="Extract key facts.",
+            rate=0.5, 
+            force_tokens=['\n', '.']
+        )
+        processed_data = compressed['compressed_prompt']
     
-    # 3. Synthesize via Pydantic AI
-    synthesis_prompt = f"Topic: '{topic}'.\nRaw Data:\n{compressed_data['compressed_prompt']}"
+    synthesis_prompt = f"Topic: '{topic}'.\nRaw Data:\n{processed_data}"
     
     try:
-        # Pydantic AI automatically handles the Groq HTTP connection
         result = await research_agent.run(synthesis_prompt)
         return result.output
     except Exception as e:
