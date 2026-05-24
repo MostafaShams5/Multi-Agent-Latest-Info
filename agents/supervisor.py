@@ -1,176 +1,114 @@
 import json
 import re
 import asyncio
-from litellm import acompletion
+from pydantic_ai import Agent, RunContext
 from tools.search import perform_web_search
 from tools.weather import fetch_weather
 from tools.telegram import send_telegram_message
 from tools.gmail import send_gmail_report
+from tools.knowledge_base import query_internal_documents
 from agents.researcher import researcher_agent
 from agents.tasks import send_periodic_weather_report
 from infrastructure.redis_queue import scheduler
 from infrastructure.qdrant_store import get_memory, save_memory
 from infrastructure.logger import logger
 
+# --- UPGRADED SUPERVISOR ---
+supervisor = Agent(
+    'groq:llama-3.3-70b-versatile',
+    system_prompt=(
+        "You are an elite, highly intelligent AI assistant. "
+        "If a user wants to schedule a report, you MUST gather the locations, the email, and the time interval. "
+        "CRITICAL: If the user provides an email in a follow-up message, you MUST look at the CONVERSATION HISTORY to find the city and time they requested earlier. "
+        "NEVER guess or invent cities (like 'New York') if the user explicitly asked for a different city."
+    )
+)
+
+@supervisor.tool
+async def schedule_automated_report(ctx: RunContext[int], locations: list[str], email: str, interval_minutes: int = 60) -> str:
+    """Schedules a recurring weather/status report for the user."""
+    chat_id = ctx.deps
+    job_id = f"weather_report_{chat_id}"
+
+    scheduler.add_job(
+        send_periodic_weather_report, 'interval', minutes=interval_minutes, 
+        args=[chat_id, locations, email], id=job_id, replace_existing=True 
+    )
+    asyncio.create_task(send_periodic_weather_report(chat_id, locations, email))
+    return f"Scheduled for {', '.join(locations)} every {interval_minutes} minutes."
+
+@supervisor.tool
+async def dispatch_deep_research(ctx: RunContext[int], topic: str, email: str) -> str:
+    """Triggers the background Worker Agent to research a topic and email the results."""
+    chat_id = ctx.deps
+    async def background_workflow():
+        report = await researcher_agent(topic)
+        await send_gmail_report(to_email=email, subject=f"Research: {topic}", content=report)
+        await send_telegram_message(chat_id, f"✅ Research on '{topic}' is in your inbox!")
+    
+    asyncio.create_task(background_workflow())
+    return f"Worker Agent deployed for '{topic}'."
+
+@supervisor.tool
+async def check_current_weather(ctx: RunContext[int], location: str) -> str:
+    """Gets the real-time weather for a specific city."""
+    return await fetch_weather(location)
+
+@supervisor.tool
+async def search_live_web(ctx: RunContext[int], query: str) -> str:
+    """Searches the public internet for news or facts."""
+    return await perform_web_search(query)
+
+@supervisor.tool
+async def search_internal_documents(ctx: RunContext[int], query: str) -> str:
+    """Searches the private RAG database for internal files and documents."""
+    return await query_internal_documents(query)
+
+
+# --- THE MESSAGE ROUTER ---
 async def process_telegram_message(user_text: str, chat_id: int) -> str:
-    # 1. Fetch Stateless Memory
+    # 1. Fetch memory for context (Cache has been removed from this layer!)
     chat_history = await get_memory(chat_id)
     chat_history.append({"role": "user", "content": user_text})
-    chat_history = chat_history[-10:] # Keep last 10 messages
+    
+    # 2. Clean Context Formatting
+    history_text = ""
+    for msg in chat_history[-6:-1]: 
+        role_name = "User" if msg["role"] == "user" else "Assistant"
+        history_text += f"{role_name}: {msg['content']}\n"
 
-    is_report_request = "report" in user_text.strip().lower()
-
-    # 2. Dynamic Tool Schema (No hardcoded times)
-    tools = [
-        {
-            "type": "function",
-            "function": {
-                "name": "setup_periodic_report",
-                "description": "Schedule a recurring automated report.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "locations": {"type": "array", "items": {"type": "string"}},
-                        "email": {"type": "string"},
-                        "interval_minutes": {"type": "integer", "description": "Minutes between reports. Default 60."}
-                    },
-                    "required": ["locations", "interval_minutes"] 
-                }
-            }
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "fetch_weather",
-                "description": "Get current weather for a specific location.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {"location": {"type": "string"}},
-                    "required": ["location"]
-                }
-            }
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "dispatch_custom_research",
-                "description": "Trigger a deep research report on a topic and email it.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "topic": {"type": "string"},
-                        "email": {"type": "string"}
-                    },
-                    "required": ["topic", "email"]
-                }
-            }
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "perform_web_search",
-                "description": "Search the internet for real-world information.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {"query": {"type": "string"}},
-                    "required": ["query"]
-                }
-            }
-        }
-    ]
-
-    # 3. Upgraded Supervisor Prompt
-    system_prompt = """
-    You are an elite orchestration agent.
-    RULES:
-    1. Reply conversationally to small talk. Use the chat history for context.
-    2. If a user wants a recurring report but provides no time, default to 60 minutes.
-    3. If they ask for deep research to be emailed, deploy the dispatch_custom_research tool.
-    4. NEVER hallucinate data. Use perform_web_search for real-time facts.
-    """
-
-    messages_for_llm = [{"role": "system", "content": system_prompt}] + chat_history
+    # 3. Bulletproof Memory Injection Prompt
+    context_prompt = (
+        f"--- CONVERSATION HISTORY ---\n{history_text}\n"
+        f"--- CURRENT USER MESSAGE ---\nUser: {user_text}\n\n"
+        f"INSTRUCTION: If the current message is just an email address, extract the requested city and time interval from the CONVERSATION HISTORY to execute the tool."
+    )
 
     try:
-        tool_choice = {"type": "function", "function": {"name": "setup_periodic_report"}} if is_report_request else "auto"
+        # Run the agent
+        result = await supervisor.run(context_prompt, deps=chat_id)
+        final_reply = result.output 
+        
+        # --- THE SAFETY NET: Catch Groq's XML Hallucinations ---
+        if "<function" in final_reply:
+            logger.warning(f"Intercepted Groq XML Hallucination: {final_reply}")
+            
+            if "search_live_web" in final_reply:
+                query_match = re.search(r'"query":\s*"([^"]+)"', final_reply)
+                if query_match:
+                    query = query_match.group(1)
+                    logger.info(f"Safety Net Executing Search for: {query}")
+                    final_reply = await perform_web_search(query)
+                else:
+                    final_reply = "Let me look that up for you..."
+            elif "hello" in user_text.lower() or "hi" in user_text.lower():
+                final_reply = "Hello! How can I help you today?"
+            else:
+                final_reply = "I am processing that request right now."
 
-        response = await acompletion(
-            model="groq/llama-3.3-70b-versatile",
-            messages=messages_for_llm,
-            tools=tools,
-            tool_choice=tool_choice,
-            temperature=0.1
-        )
-
-        message = response.choices[0].message
-        final_reply = ""
-
-        if hasattr(message, 'tool_calls') and message.tool_calls:
-            for tool_call in message.tool_calls:
-                
-                raw_args = tool_call.function.arguments
-                try: args = json.loads(raw_args)
-                except: 
-                    match = re.search(r'\{.*?\}', raw_args, re.DOTALL)
-                    args = json.loads(match.group(0)) if match else {}
-
-                # COMMAND: SCHEDULE REPORT
-                if tool_call.function.name == "setup_periodic_report":
-                    locations = args.get("locations", [])
-                    email = args.get("email")
-                    interval = args.get("interval_minutes", 60)
-                    
-                    if not locations: 
-                        final_reply = "Please specify the cities for the report."
-                    else:
-                        job_id = f"weather_report_{chat_id}"
-                        
-                        # Replace existing prevents duplicates
-                        scheduler.add_job(
-                            send_periodic_weather_report, 
-                            'interval', 
-                            minutes=interval, 
-                            args=[chat_id, locations, email], 
-                            id=job_id,
-                            replace_existing=True 
-                        )
-                        
-                        # Fire immediately
-                        asyncio.create_task(send_periodic_weather_report(chat_id, locations, email))
-                        final_reply = f"✅ Scheduled for {', '.join(locations)} every {interval} minutes."
-
-                # COMMAND: WEATHER
-                elif tool_call.function.name == "fetch_weather":
-                    loc = args.get("location")
-                    final_reply = await fetch_weather(loc) if loc else "I need a city name."
-
-                # COMMAND: RESEARCH DISPATCH (Agent-to-Agent)
-                elif tool_call.function.name == "dispatch_custom_research":
-                    topic = args.get("topic")
-                    email = args.get("email")
-                    
-                    if not email:
-                        final_reply = "I need your email address to send the research report!"
-                    else:
-                        async def background_research_workflow():
-                            report_content = await researcher_agent(topic)
-                            await send_gmail_report(to_email=email, subject=f"Research Report: {topic}", content=report_content)
-                            await send_telegram_message(chat_id, f"✅ Deep research on '{topic}' complete. Check your inbox!")
-
-                        asyncio.create_task(background_research_workflow())
-                        final_reply = f"🕵️‍♂️ Researcher Agent deployed for '{topic}'. I'll notify you when it hits your inbox."
-
-                # COMMAND: SEARCH
-                elif tool_call.function.name == "perform_web_search":
-                    query = args.get("query", user_text)
-                    final_reply = await perform_web_search(query=query)
-
-        else:
-            final_reply = message.content or "Processed, but no response generated."
-
-        # 4. Save state securely back to Qdrant
+        # 4. Save state
         chat_history.append({"role": "assistant", "content": final_reply})
-        await save_memory(chat_id, chat_history)
+        await save_memory(chat_id, chat_history[-10:])
         
         return final_reply
 

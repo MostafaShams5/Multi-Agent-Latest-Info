@@ -1,36 +1,45 @@
-from litellm import acompletion
+from pydantic_ai import Agent
 from tools.search import perform_web_search
+from llmlingua import PromptCompressor
 from infrastructure.logger import logger
+import os
+
+
+compressor = PromptCompressor(
+    model_name="microsoft/llmlingua-2-bert-base-multilingual-cased-meetingbank", 
+    use_llmlingua2=True,
+    device_map="cpu"  # <--- ADD THIS LINE TO FORCE CPU MODE
+)
+
+research_agent = Agent(
+    'groq:llama-3.1-8b-instant',
+    system_prompt="You are an expert analyst. Write clean, professional email reports. Use markdown headings."
+)
 
 async def researcher_agent(topic: str) -> str:
-    """A dedicated fast-agent that researches a topic and writes a report."""
-    logger.info(f"🕵️‍♂️ [Researcher Agent] Investigating: '{topic}'")
+    logger.info(f"🕵️‍♂️ [Worker Agent] Investigating: '{topic}'")
     
-    search_prompt = f"You are a researcher. Generate a single, highly effective search query to find the latest information about: {topic}. Output ONLY the search query."
+    # 1. Gather Raw Data
+    search_query = f"Latest news and facts about {topic}"
+    raw_data = await perform_web_search(query=search_query)
+    
+    # 2. Token Compression (LLMLingua)
+    # Reduces massive context windows while retaining semantic meaning
+    logger.info("🗜️ Compressing web data tokens...")
+    compressed_data = compressor.compress_prompt(
+        context=[raw_data],
+        instruction="Extract key facts.",
+        rate=0.5, # Compress by 50%
+        force_tokens=['\n', '.']
+    )
+    
+    # 3. Synthesize via Pydantic AI
+    synthesis_prompt = f"Topic: '{topic}'.\nRaw Data:\n{compressed_data['compressed_prompt']}"
     
     try:
-        query_response = await acompletion(
-            model="groq/llama-3.1-8b-instant", 
-            messages=[{"role": "user", "content": search_prompt}]
-        )
-        search_query = query_response.choices[0].message.content.strip()
-        
-        raw_data = await perform_web_search(query=search_query)
-        
-        synthesis_prompt = f"""
-        You are an expert analyst. Write a clean, professional email report on the topic: '{topic}'.
-        Use this raw data: {raw_data}
-        Format with headings and bullet points.
-        """
-        
-        report_response = await acompletion(
-            model="groq/llama-3.1-8b-instant",
-            messages=[{"role": "user", "content": synthesis_prompt}],
-            temperature=0.3
-        )
-        
-        return report_response.choices[0].message.content
-
+        # Pydantic AI automatically handles the Groq HTTP connection
+        result = await research_agent.run(synthesis_prompt)
+        return result.output
     except Exception as e:
         logger.error(f"Worker Agent Failed: {e}")
         return f"Research failed for '{topic}'."

@@ -1,0 +1,16 @@
+fastapi
+uvicorn
+httpx
+qdrant-client
+litellm
+apscheduler
+redis
+python-dotenv
+google-api-python-client
+google-auth-httplib2
+google-auth-oauthlib
+pydantic-ai
+llmlingua
+llama-index-core
+llama-index-vector-stores-qdrant
+llama-index-embeddings-fastembed

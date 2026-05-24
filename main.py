@@ -7,20 +7,18 @@ from infrastructure.qdrant_store import init_qdrant
 from agents.supervisor import process_telegram_message
 from tools.telegram import send_telegram_message, handle_callback
 
+from infrastructure.semantic_cache import init_cache
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("🚀 Booting AI Infrastructure...")
-    
-    # Init Databases
     await init_qdrant()
+    await init_cache() # Boot the semantic cache
     
-    # Start Redis Queue (Automatically restores jobs!)
     scheduler.start()
     logger.info("⚡ Redis Background queues restored.")
-    
     yield
     scheduler.shutdown()
-
 app = FastAPI(lifespan=lifespan)
 
 @app.post("/webhook")

@@ -1,9 +1,12 @@
-from qdrant_client import QdrantClient
+from qdrant_client import QdrantClient, AsyncQdrantClient # <--- ADD AsyncQdrantClient
 from qdrant_client.models import VectorParams, Distance, PointStruct
 from config import QDRANT_URL
 from infrastructure.logger import logger
 
 qdrant = QdrantClient(url=QDRANT_URL)
+aqdrant = AsyncQdrantClient(url=QDRANT_URL) # <--- ADD THIS LINE
+
+
 MEMORY_COLLECTION = "chat_memory"
 
 async def init_qdrant():
