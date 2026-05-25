@@ -9,8 +9,9 @@ from tools.weather import fetch_weather
 from tools.telegram import send_telegram_message
 from tools.gmail import send_gmail_report
 from tools.knowledge_base import query_internal_documents
-from agents.researcher import researcher_agent
 
+from agents.researcher import researcher_action
+from agents.reporter import format_and_email
 # Infrastructure Imports
 from infrastructure.qdrant_store import get_memory, save_memory
 from infrastructure.semantic_cache import check_cache, save_to_cache
@@ -21,13 +22,13 @@ from tools.media import search_tv_shows, search_itunes_media
 from tools.sports import get_recent_football_matches
 from tools.science import check_recent_earthquakes, locate_iss
 
-from tools.sports import get_football_matches
+import re
+
 from tools.news import get_currents_news, search_hacker_news, search_dev_articles
 from tools.finance import convert_currency, get_live_crypto_price
 
 
-# ==========================================
-# 1. THE TRIAGE ROUTER (Speed & Cost Optimization)
+
 # ==========================================
 class RoutingDecision(BaseModel):
     category: Literal["small_talk", "simple_tool", "complex_task"]
@@ -35,30 +36,49 @@ class RoutingDecision(BaseModel):
     email_target: Optional[str] = None
 
 triage_agent = Agent(
-    'groq:llama-3.1-8b-instant',
+    'groq:qwen/qwen3-32b',
     output_type=RoutingDecision,
+    retries=3,  # <--- FIX 1: Give the model 3 automatic attempts to fix its JSON formatting
     system_prompt=(
         "You are the frontline system gateway. Analyze the user's message and the conversation history.\n"
         "1. If it's a greeting, casual chat, or pleasantry, set category to 'small_talk' and provide a friendly 'direct_response'.\n"
-        "2. If the user wants a quick fact, web search, internal document search, weather, sports scores, earthquake data, media/TV ratings, music/songs, official breaking news, Arabic news, local Egyptian news, Dev.to articles, or Hacker News discussions, set category to 'simple_tool'.\n"
-        "3. If the user asks for deep research, multiple complex tasks, or explicitly asks to be emailed a report, set category to 'complex_task'..."
+        "2. If the user wants a quick fact, web search, internal document search, weather, sports scores, earthquake data, media/TV ratings, music/songs, official breaking news, Arabic news, local Egyptian news, Dev.to articles, Hacker News discussions, currency conversion, or crypto prices, set category to 'simple_tool'.\n"
+        "3. If the user asks for deep research, multiple complex tasks, or explicitly asks to be emailed a report, set category to 'complex_task'. Look closely at the history to extract their email into 'email_target' if they previously provided it.\n\n"
+        "CRITICAL FORMATTING RULES:\n"
+        "- You MUST return ONLY pure, raw valid JSON.\n"
+        "- DO NOT wrap your response in <function> tags, HTML, or markdown code blocks.\n"
+        "- DO NOT hallucinate or call external tools (e.g., never output <function=brave_search>)."
     )
 )
 
-# ==========================================
-# 2. THE SUPERVISOR (70B Orchestrator)
-# ==========================================
-triage_agent = Agent(
-    'groq:llama-3.1-8b-instant',
-    output_type=RoutingDecision,
+
+
+supervisor = Agent(
+    'groq:llama-3.3-70b-versatile',
+    retries=3,
     system_prompt=(
-        "You are the frontline system gateway. Analyze the user's message and the conversation history.\n"
-        "1. If it's a greeting, casual chat, or pleasantry, set category to 'small_talk' and provide a friendly 'direct_response'.\n"
-        # UPDATED: Added currency conversion and crypto prices
-        "2. If the user wants a quick fact, web search, internal document search, weather, sports scores, earthquake data, media/TV ratings, music/songs, official breaking news, Arabic news, local Egyptian news, Dev.to articles, Hacker News discussions, currency conversion, or crypto prices, set category to 'simple_tool'.\n"
-        "3. If the user asks for deep research, multiple complex tasks, or explicitly asks to be emailed a report, set category to 'complex_task'..."
+        "You are an expert AI orchestrator. You have access to tools to assist the user.\n"
+        "INSTRUCTIONS:\n"
+        "- When you need information, you MUST use the provided tools.\n"
+        "- Do NOT write out <function> tags or XML in your response. Simply invoke the tool function directly.\n"
+        "- If you need to search for a football match, use 'lookup_global_football'.\n"
+        "- If you need music info, use the music tools."
     )
 )
+@supervisor.tool
+async def lookup_tv_show(ctx: RunContext[int], query: str) -> str:
+    """Searches for summaries and ratings of TV shows."""
+    return await search_tv_shows(query)
+
+@supervisor.tool
+async def lookup_football_scores(ctx: RunContext[int], league: str, year: str) -> str:
+    """Gets recent match scores for European football leagues (e.g., 'bl1' for Bundesliga, 'pl' for Premier League)."""
+    return await get_recent_football_matches(league, year)
+
+@supervisor.tool
+async def check_global_earthquakes(ctx: RunContext[int]) -> str:
+    """Checks for recent major earthquakes worldwide."""
+    return await check_recent_earthquakes()
 
 @supervisor.tool
 async def check_current_weather(ctx: RunContext[int], location: str) -> str:
@@ -76,14 +96,15 @@ async def search_internal_documents(ctx: RunContext[int], query: str) -> str:
     return await query_internal_documents(query)
 
 
-@supervisor.tool
-async def lookup_global_football(ctx: RunContext[int], date_yyyy_mm_dd: str = None, team_name: str = None) -> str:
-    """
-    Searches global football (soccer) fixtures.
-    - date_yyyy_mm_dd: The date to search (e.g., '2026-05-24'). Leave None for today.
-    - team_name: CRITICAL - Always provide a team name (e.g., 'Flamengo', 'Liverpool') if the user asks for a specific team, to avoid pulling hundreds of unrelated matches.
-    """
-    return await get_football_matches(date=date_yyyy_mm_dd, team_filter=team_name)
+#@supervisor.tool
+#async def lookup_global_football(ctx: RunContext[int], date_yyyy_mm_dd: str = None, team_name: str = None) -> str:
+#    """
+#    Searches global football (soccer) fixtures.
+#    - date_yyyy_mm_dd: The date to search (e.g., '2026-05-24'). Leave None for today.
+#    - team_name: CRITICAL - Always provide a team name (e.g., 'Flamengo', 'Liverpool') if the user asks for a specific team, to avoid pulling hundreds of unrelated matches.
+#    """
+#    return await get_football_matches(date=date_yyyy_mm_dd, team_filter=team_name)
+    
     
     
 
@@ -131,55 +152,58 @@ async def check_crypto_trading_pair(ctx: RunContext[int], symbol: str) -> str:
 
 
 async def background_complex_workflow(chat_id: int, task_description: str, email: str):
-    """Handles deep research and email dispatch without blocking the main event loop."""
-    logger.info(f"🚀 [Worker] Starting background task for {chat_id}")
+    """A multi-model pipeline running non-blocking in the background."""
+    logger.info(f"🚀 [Worker] Starting multi-model pipeline for {chat_id}")
     
-    # Run the researcher agent (which includes your smart LLMLingua compression)
-    report = await researcher_agent(task_description)
+    # 1. Qwen 3 32B extracts the heavy data (Synthesis Phase)
+    raw_report = await researcher_action(task_description)
     
-    # Email the final results
-    await send_gmail_report(to_email=email, subject="Your Agentic Task Results", content=report)
+    # 2. Gemma 2 9B formats it beautifully and sends it via Gmail (Reporting Phase)
+    success = await format_and_email(raw_data=raw_report, email=email, topic=task_description)
     
-    # Notify user on Telegram
-    await send_telegram_message(chat_id, "✅ Your requested research is complete and has been sent to your inbox!")
+    if success:
+        await send_telegram_message(chat_id, "✅ Your research was analyzed by Qwen and beautifully formatted by Gemma! Check your inbox.")
+    else:
+        await send_telegram_message(chat_id, "⚠️ The research completed, but I encountered an error during email dispatch.")
 
 
-@supervisor.tool
-async def lookup_tv_show(ctx: RunContext[int], query: str) -> str:
-    """Searches for summaries and ratings of TV shows."""
-    return await search_tv_shows(query)
 
-@supervisor.tool
-async def lookup_football_scores(ctx: RunContext[int], league: str, year: str) -> str:
-    """Gets recent match scores for European football leagues (e.g., 'bl1' for Bundesliga, 'pl' for Premier League)."""
-    return await get_recent_football_matches(league, year)
-
-@supervisor.tool
-async def check_global_earthquakes(ctx: RunContext[int]) -> str:
-    """Checks for recent major earthquakes worldwide."""
-    return await check_recent_earthquakes()
-
+# ... [Scroll down to the message processor] ...
 
 async def process_telegram_message(user_text: str, chat_id: int) -> str:
-    # A. Check Semantic Cache First (0 API Calls)
     cached_reply = await check_cache(user_text)
     if cached_reply:
         return cached_reply
 
-    # B. Fetch Memory
     chat_history = await get_memory(chat_id)
     chat_history.append({"role": "user", "content": user_text})
     
-    history_text = "\n".join(
-        [f"{msg['role'].capitalize()}: {msg['content']}" for msg in chat_history[-6:]]
-    )
-
+    history_text = "\n".join([f"{msg['role'].capitalize()}: {msg['content']}" for msg in chat_history[-6:]])
     triage_prompt = f"History:\n{history_text}\n\nCurrent User Message: {user_text}"
 
     try:
-        # C. Triage via 8B Model (Fast & Cheap)
-        triage = await triage_agent.run(triage_prompt)
-        decision = triage.output
+        # 🛡️ THE TRIAGE FALLBACK LOOP
+        triage_models = [
+            'groq:qwen/qwen3-32b',                  # Primary: High accuracy JSON
+            'groq:llama-3.3-70b-versatile',         # Fallback 1: High reliability
+            'groq:moonshotai/kimi-k2-instruct-0905' # Fallback 2: Kimi
+        ]
+        
+        decision = None
+        for model_id in triage_models:
+            try:
+                # Dynamically inject the model ID to override the Agent's default
+                triage = await triage_agent.run(triage_prompt, model=model_id)
+                decision = triage.output
+                logger.info(f"⚡ Triage successful using {model_id}")
+                break # Success! Break out of the fallback loop.
+            except Exception as e:
+                logger.warning(f"⚠️ Triage failed with {model_id}: {e}. Trying fallback...")
+                
+        # If all models in the array failed
+        if not decision:
+            return "System diagnostic: All routing models are currently offline or rate-limited."
+            
         final_reply = ""
 
         # PATH 1: Small Talk (Handled instantly by 8B)
@@ -201,7 +225,7 @@ async def process_telegram_message(user_text: str, chat_id: int) -> str:
         elif decision.category == "simple_tool":
             logger.info("🧠 Escalating to 70B Supervisor")
             result = await supervisor.run(triage_prompt, deps=chat_id)
-            final_reply = result.output 
+            final_reply = re.sub(r'<function=.*?>.*?</function>', '', result.output, flags=re.DOTALL)
 
         # D. Save State & Cache
         chat_history.append({"role": "assistant", "content": final_reply})

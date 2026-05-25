@@ -3,7 +3,7 @@ from datetime import datetime
 from config import FOOTBALL_API_KEY
 from infrastructure.logger import logger
 
-async def get_football_matches(date: str = None, team_filter: str = None) -> str:
+async def get_recent_football_matches(date: str = None, team_filter: str = None) -> str:
     """
     Gets global football matches for a specific date. 
     Applies a local team_filter to prevent sending 700+ daily matches to the LLM.
