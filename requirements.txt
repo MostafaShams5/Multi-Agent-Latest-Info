@@ -14,3 +14,6 @@ llmlingua
 llama-index-core
 llama-index-vector-stores-qdrant
 llama-index-embeddings-fastembed
+gunicorn
+sentry-sdk
+logfire
