@@ -67,15 +67,26 @@ async def telegram_webhook(
             await redis_client.expire(rate_key, 60)
             
         # If they exceed 5 messages, block them
+# In main.py, inside your telegram_webhook route, update the final processing block:
+
+        # If they exceed 5 messages, block them
         if request_count > 5:
             logger.warning(f"🛑 Rate limit exceeded for {chat_id}")
-            # Only warn them on the 6th message to avoid spamming them back
             if request_count == 6:
                 await send_telegram_message(chat_id, "⚠️ You are sending messages too quickly. Please wait 60 seconds.")
             return {"status": "rate_limited"}
         
-        # The Supervisor handles everything
-        reply_text = await process_telegram_message(user_text, chat_id)
-        await send_telegram_message(chat_id, reply_text, show_buttons=True)
+        # 🛡️ THE RACE CONDITION FIX: Redis Distributed Lock
+        # This lock ensures that if User A sends 3 messages instantly, they are processed 
+        # strictly sequentially (Message 1 -> 2 -> 3). This prevents Qdrant memory overwrites.
+        # It times out after 15 seconds to prevent deadlocks if a crash occurs.
+        lock_key = f"chat_memory_lock:{chat_id}"
+        
+        # We acquire the lock. Other concurrent requests for THIS user will pause here and wait.
+        async with redis_client.lock(lock_key, timeout=15.0, blocking_timeout=15.0):
+            # The Supervisor handles everything
+            reply_text = await process_telegram_message(user_text, chat_id)
+            await send_telegram_message(chat_id, reply_text, show_buttons=True)
 
     return {"status": "ok"}
+
